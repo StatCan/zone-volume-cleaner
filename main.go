@@ -77,17 +77,6 @@ func main() {
 		log.Fatalf("Error while building kube clientset: %s", err.Error())
 	}
 
-	// // creates the in-cluster config
-	// config, err := rest.InClusterConfig()
-	// if err != nil {
-	// 	panic(err.Error())
-	// }
-	// // creates the clientset
-	// clientset, err := kubernetes.NewForConfig(config)
-	// if err != nil {
-	// 	panic(err.Error())
-	// }
-
 	// Authenticating with Azure using the default environment variables
 	// https://pkg.go.dev/github.com/Azure/azure-sdk-for-go/sdk/azidentity#section-readme
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
