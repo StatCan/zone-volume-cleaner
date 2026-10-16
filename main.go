@@ -28,14 +28,14 @@ func main() {
 	}
 
 	// Setup configs
-	var params CleanerParams
-	flag.StringVar(&params.AzureResourceGroup, "AZURE_RESOURCE_GROUP", os.Getenv("AZURE_RESOURCE_GROUP"), "Azure resoure group for the disks")
-	flag.StringVar(&params.AzureSubscriptionID, "AZURE_SUBSCRIPTION_ID", os.Getenv("AZURE_SUBSCRIPTION_ID"), "Azure subscription ID for the disks")
-	flag.BoolVar(&params.DryRun, "DRY_RUN", cleanerUtils.GetEnv("DRY_RUN", "true") == "true", "Dry run without harmful operations")
-	flag.IntVar(&params.GracePeriod, "GRACE_PERIOD", cleanerUtils.GetIntEnv("GRACE_PERIOD", 365), "Grace period for Disks (in days)")
-	flag.StringVar(&params.NotificationTimesString, "NOTIF_TIMES", os.Getenv("NOTIF_TIMES"), "comma-seperated list of times to send notifications before volume deletion(in days)")
-	flag.StringVar(&params.TestEmail, "TEST_EMAIL", os.Getenv("TEST_EMAIL"), "Email to use for testing notifications (to be used with TEST_NAMESPACE)")
-	flag.StringVar(&params.TestNamespace, "TEST_NAMESPACE", os.Getenv("TEST_NAMESPACE"), "Limit the cleaner to only look at a specific namespace for testing")
+	var params cleanerParams
+	flag.StringVar(&params.azureResourceGroup, "AZURE_RESOURCE_GROUP", os.Getenv("AZURE_RESOURCE_GROUP"), "Azure resoure group for the disks")
+	flag.StringVar(&params.azureSubscriptionID, "AZURE_SUBSCRIPTION_ID", os.Getenv("AZURE_SUBSCRIPTION_ID"), "Azure subscription ID for the disks")
+	flag.BoolVar(&params.dryRun, "DRY_RUN", cleanerUtils.GetEnv("DRY_RUN", "true") == "true", "Dry run without harmful operations")
+	flag.IntVar(&params.gracePeriod, "GRACE_PERIOD", cleanerUtils.GetIntEnv("GRACE_PERIOD", 365), "Grace period for Disks (in days)")
+	flag.StringVar(&params.notificationTimesString, "NOTIF_TIMES", os.Getenv("NOTIF_TIMES"), "comma-seperated list of times to send notifications before volume deletion(in days)")
+	flag.StringVar(&params.testEmail, "TEST_EMAIL", os.Getenv("TEST_EMAIL"), "Email to use for testing notifications (to be used with TEST_NAMESPACE)")
+	flag.StringVar(&params.testNamespace, "TEST_NAMESPACE", os.Getenv("TEST_NAMESPACE"), "Limit the cleaner to only look at a specific namespace for testing")
 
 	// Get configs for the email notifications (GC Notify in our case)
 	var emailConfigs cleanerUtils.EmailConfigs
@@ -56,11 +56,11 @@ func main() {
 	flag.Parse()
 
 	// Validate parameters
-	if params.GracePeriod < 1 {
+	if params.gracePeriod < 1 {
 		log.Fatal("Error while validating params. For safety reasons, grace period cannot be lower than one day.")
 	}
 
-	params.NotificationTimes = cleanerUtils.ParseNotificationTimes(params.NotificationTimesString)
+	params.notificationTimes = cleanerUtils.ParseNotificationTimes(params.notificationTimesString)
 
 	// use the current context in kubeconfig
 	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
@@ -92,7 +92,7 @@ func main() {
 		log.Fatalf("Error while building Azure Credential: %s", err.Error())
 	}
 
-	disksClient, err := armcompute.NewDisksClient(params.AzureSubscriptionID, cred, nil)
+	disksClient, err := armcompute.NewDisksClient(params.azureSubscriptionID, cred, nil)
 	if err != nil {
 		log.Fatalf("Error while building Azure Disk Client: %s", err.Error())
 	}
@@ -120,9 +120,21 @@ func main() {
 		kubeflowClient:       kubeflowClientset,
 		disksClient:          disksClient,
 		disableNotifications: isEmailDisabled,
+		report: &cleanerJobReport{
+			notebooksDeleted: 0,
+			volumesDeleted:   0,
+			emailsSent:       0,
+			errorsReported:   0,
+		},
 	}
 
 	cfg.cleanVolumes()
 
-	slog.Info("Zone Volume Cleaner ended")
+	// TODO: Populate/increment the report fields
+	slog.Info("Zone Volume Cleaner completed",
+		"NOTEBOOKS_DELETED", cfg.report.notebooksDeleted,
+		"VOLUMES_DELETED", cfg.report.volumesDeleted,
+		"EMAILS_SENT", cfg.report.emailsSent,
+		"ERRORS_REPORTED", cfg.report.errorsReported,
+	)
 }
