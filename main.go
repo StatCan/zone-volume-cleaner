@@ -24,7 +24,7 @@ func main() {
 	// Read a local .env file if present
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("Error loading .env file")
+		log.Printf("Error loading .env file: %s", err.Error())
 	}
 
 	// Setup configs
@@ -44,12 +44,15 @@ func main() {
 	flag.StringVar(&emailConfigs.EmailTemplateID, "EMAIL_TEMPLATE_ID", os.Getenv("EMAIL_TEMPLATE_ID"), "ID for the email template in the email notification service")
 	flag.StringVar(&emailConfigs.APIKey, "EMAIL_API_KEY", os.Getenv("EMAIL_API_KEY"), "Api key for the email notification service")
 
-	// Define kube config to read local context if present
-	var kubeconfig *string
-	if home := homedir.HomeDir(); home != "" {
-		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
+	// Check if we are running inside the cluster, and default to using that instead of kubeconfig if that's the case
+	_, err = os.Stat("/var/run/secrets/kubernetes.io/serviceaccount")
+
+	// Setup the default path to the of the kubeconfig file
+	var kubeconfig string
+	if home := homedir.HomeDir(); os.IsNotExist(err) && home != "" {
+		flag.StringVar(&kubeconfig, "kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
 	} else {
-		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
+		flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	}
 
 	// Parse flags
@@ -63,7 +66,7 @@ func main() {
 	params.notificationTimes = cleanerUtils.ParseNotificationTimes(params.notificationTimesString)
 
 	// use the current context in kubeconfig
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
 		log.Fatalf("Error while building kube config: %s", err.Error())
 	}
