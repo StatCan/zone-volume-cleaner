@@ -4,8 +4,10 @@ import (
 	"flag"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v8"
@@ -105,12 +107,16 @@ func main() {
 		slog.Warn("Email notification configs are not fully setup. Skipping emailing volume owners.")
 	}
 
+	// http client is created for emailing users
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+
 	cfg := CleanerConfigs{
 		params:               params,
 		emailConfigs:         emailConfigs,
 		clientset:            clientset,
 		kubeflowClient:       kubeflowClientset,
 		disksClient:          disksClient,
+		httpClient:           httpClient,
 		disableNotifications: isEmailDisabled,
 		report: &cleanerJobReport{
 			notebooksDeleted: 0,
@@ -122,8 +128,8 @@ func main() {
 
 	cfg.cleanVolumes()
 
-	// TODO: Populate/increment the report fields
 	slog.Info("Zone Volume Cleaner completed",
+		"DRY_RUN", cfg.params.dryRun,
 		"NOTEBOOKS_DELETED", cfg.report.notebooksDeleted,
 		"VOLUMES_DELETED", cfg.report.volumesDeleted,
 		"EMAILS_SENT", cfg.report.emailsSent,

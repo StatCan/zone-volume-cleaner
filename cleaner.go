@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -44,6 +44,7 @@ type CleanerConfigs struct {
 	clientset            *kubernetes.Clientset
 	kubeflowClient       *kubeflow.Clientset
 	disksClient          *armcompute.DisksClient
+	httpClient           *http.Client
 	disableNotifications bool
 	report               *cleanerJobReport
 }
@@ -54,45 +55,48 @@ const (
 )
 
 func (cfg *CleanerConfigs) cleanVolumes() {
-	// One http client is created for emailing users
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-
 	// check if the test namespace was set
 	if cfg.params.testNamespace != "" {
 		slog.Info("Running only on testing namespace", "NAMESPACE", cfg.params.testNamespace)
 
-		err := cfg.cleanNamespaceVolumes(cfg.params.testNamespace, cfg.params.testEmail, httpClient)
+		err := cfg.cleanNamespaceVolumes(cfg.params.testNamespace, cfg.params.testEmail)
+		// Job report error count will be incremented inside the function
 		if err != nil {
 			slog.Error("Error occured while cleaning volumes for namespace", "NAMESPACE", cfg.params.testNamespace, "ERROR", err)
 		}
 		return
 	}
 
+	// TODO: Set a solution for users on extended leave, probably a label on namespaces/profiles
 	profileNamespaces, err := cfg.clientset.CoreV1().Namespaces().List(context.TODO(), v1.ListOptions{
 		LabelSelector: "app.kubernetes.io/part-of=kubeflow-profile",
 	})
 	if err != nil {
+		cfg.report.errorsReported++
 		slog.Error("Error while getting namespaces", "ERROR", err)
+		return
 	}
 
 	for _, ns := range profileNamespaces.Items {
 		ownerEmail := ns.Annotations[NS_OWNER_ANNOTATION]
 
-		err := cfg.cleanNamespaceVolumes(ns.Name, ownerEmail, httpClient)
+		err := cfg.cleanNamespaceVolumes(ns.Name, ownerEmail)
+		// Job report error count will be incremented inside the function
 		if err != nil {
-			// If an error occurs, move to the next namespace
 			slog.Error("Error occured while cleaning volumes for namespace", "NAMESPACE", cfg.params.testNamespace, "ERROR", err)
+			// If an error occurs, move to the next namespace
 			continue
 		}
 	}
 }
 
-func (cfg *CleanerConfigs) cleanNamespaceVolumes(ns string, ownerEmail string, httpClient *http.Client) error {
+func (cfg *CleanerConfigs) cleanNamespaceVolumes(ns string, ownerEmail string) error {
 	logger := slog.Default().With("NAMESPACE", ns)
 
 	// get PVCs for profile namespace
 	pvcs, err := cfg.clientset.CoreV1().PersistentVolumeClaims(ns).List(context.TODO(), v1.ListOptions{})
 	if err != nil {
+		cfg.report.errorsReported++
 		logger.Error("Error while getting PVCs", "ERROR", err)
 		return err
 	}
@@ -103,11 +107,11 @@ func (cfg *CleanerConfigs) cleanNamespaceVolumes(ns string, ownerEmail string, h
 		pvcsMap[pvc.Name] = pvc
 	}
 
-	// Get a map of notebooks and their volumes for easier manipulation
-	// using a map object to get the list of attached PVC names to make it a unique list. The bool value is irrelevant
-	attachedPvcMap := make(map[string]bool)
-	notebookPvcMap, err := setupNotebooksPvcsInfo(cfg.kubeflowClient, ns, pvcsMap, attachedPvcMap, logger)
+	// Get the formatted data for the notebooks and their associated PVCs, as well as the list of all attached PVCs
+	notebookPvcMap, attachedPvcMap, err := getNotebooksPvcsInfo(cfg.kubeflowClient, ns, pvcsMap)
 	if err != nil {
+		cfg.report.errorsReported++
+		logger.Error("Error while setting up notebooks PVCs information", "ERROR", err)
 		return err
 	}
 
@@ -122,14 +126,16 @@ func (cfg *CleanerConfigs) cleanNamespaceVolumes(ns string, ownerEmail string, h
 	}
 
 	// Clean volumes not attached to notebooks
-	err = cfg.cleanUnattachedNamespaceVolumes(unattachedPvcs, ownerEmail, httpClient, logger)
+	err = cfg.cleanUnattachedNamespaceVolumes(unattachedPvcs, ownerEmail, logger)
+	// Job report error count will be incremented inside the function
 	if err != nil {
 		logger.Error("Error while cleaning unattached PVCs", "ERROR", err)
 		return err
 	}
 
 	// Clean volumes that are attached to notebooks
-	err = cfg.cleanAttachedNamespaceVolumes(ns, notebookPvcMap, ownerEmail, httpClient, logger)
+	err = cfg.cleanAttachedNamespaceVolumes(ns, notebookPvcMap, ownerEmail, logger)
+	// Job report error count will be incremented inside the function
 	if err != nil {
 		logger.Error("Error while cleaning attached PVCs", "ERROR", err)
 		return err
@@ -138,109 +144,138 @@ func (cfg *CleanerConfigs) cleanNamespaceVolumes(ns string, ownerEmail string, h
 	return nil
 }
 
-func (cfg *CleanerConfigs) cleanUnattachedNamespaceVolumes(pvcs []corev1.PersistentVolumeClaim, ownerEmail string, httpClient *http.Client, logger *slog.Logger) error {
+// Deletes stale volumes that are expected to not be attached to any Kubeflow Notebook resource.
+func (cfg *CleanerConfigs) cleanUnattachedNamespaceVolumes(pvcs []corev1.PersistentVolumeClaim, ownerEmail string, logger *slog.Logger) error {
 	logger.Info("Evaluating unattached PVCs")
 
+	// If an error occurs in this loop, just log it and continue to process the next pvc
 	for _, pvc := range pvcs {
 		pvcLogger := logger.With("PVC", pvc.Name)
 
-		pvcLogger.Info("Evaluating unattached PVC")
-
-		timeUntilStale, err := cfg.getTimeUntilStale(pvc, cfg.params.gracePeriod, pvcLogger)
+		timeUntilStale, err := cfg.getTimeUntilStale(pvc, cfg.params.gracePeriod)
 		if err != nil {
-			pvcLogger.Error("Error while getting time until stale for PVC", "ERROR", err)
+			cfg.report.errorsReported++
+			pvcLogger.Error("Error while getting time until stale for PVC", "PVC_STATUS", pvc.Status.Phase, "ERROR", err)
 			continue
 		}
 
-		isStale := 0 > timeUntilStale
-		if !isStale {
-			pvcLogger.Info("Grace period not passed. PVC not stale.", "TIME_UNTIL_STALE", timeUntilStale)
-			if !cfg.disableNotifications {
-				// if the PVC is not yet stale, determine if users needs to be notified of impending stale disks.
-				if ownerEmail == "" {
-					logger.Warn("Namespace owner email could not be found. Skipping email notifications")
-					continue
-				}
+		isStale := timeUntilStale < 0
+		if isStale {
+			// if PVC is stale, proceed to delete it
+			pvcLogger.Info("PVC is stale", "TIME_UNTIL_STALE", timeUntilStale)
 
-				err := cfg.notifyPvcOwner(ownerEmail, timeUntilStale, pvc, httpClient, pvcLogger)
+			err := cfg.deletePvc(pvc, pvcLogger)
+			if err != nil {
+				cfg.report.errorsReported++
+				pvcLogger.Error("Error while deleting unattached PVC", "ERROR", err)
+				continue
+			}
+
+			if !cfg.disableNotifications {
+				//TODO: also notify user when their pvc does get deleted?
+				err = cfg.sendDeleteEmail()
 				if err != nil {
-					pvcLogger.Error("Error while trying to notify user", "ERROR", err)
+					cfg.report.errorsReported++
+					pvcLogger.Error("Error while sending email to user about recently deleted volumes", "ERROR", err)
 					continue
 				}
 			}
 		} else {
-			// if PVC is stale, proceed to delete it
-			pvcLogger.Info("PVC is stale")
-			//TODO: also notify user when their pvc does get deleted?
-			err := cfg.deletePvc(pvc, pvcLogger)
-			// if an error occurs while trying to delete the PVC,
-			// just log it and continue to the next one
-			if err != nil {
-				pvcLogger.Error("Error while trying to delete unattached PVC.", "ERROR", err)
-			}
+			pvcLogger.Info("PVC is not stale.", "TIME_UNTIL_STALE", timeUntilStale)
+			if !cfg.disableNotifications {
+				// if the PVC is not yet stale, determine if users needs to be notified of impending stale disks.
+				if ownerEmail == "" {
+					pvcLogger.Warn("Namespace owner email could not be found. Skipping email notifications")
+					continue
+				}
 
-			continue
+				err := cfg.notifyUserStaleVolume(ownerEmail, timeUntilStale, pvc, pvcLogger)
+				if err != nil {
+					cfg.report.errorsReported++
+					pvcLogger.Error("Error while sending email to user about upcoming stale volumes", "ERROR", err)
+					continue
+				}
+			}
 		}
 	}
 
 	return nil
 }
 
-func (cfg *CleanerConfigs) cleanAttachedNamespaceVolumes(ns string, notebookPvcMap map[string][]corev1.PersistentVolumeClaim, ownerEmail string, httpClient *http.Client, logger *slog.Logger) error {
+func (cfg *CleanerConfigs) cleanAttachedNamespaceVolumes(ns string, notebookPvcMap map[string][]corev1.PersistentVolumeClaim, ownerEmail string, logger *slog.Logger) error {
 	logger.Info("Evaluating attached PVCs")
 
-	for k, v := range notebookPvcMap {
-		notebookLogger := logger.With("NOTEBOOK", k)
+	for notebook, vols := range notebookPvcMap {
+		notebookLogger := logger.With("NOTEBOOK", notebook)
 
 		staleVolumesCount := 0
 		// map to keep track of which volumes are stale. Used for email notfications
 		// key is the pvc name; value is the time until stale
 		nonStaleVolumesMap := make(map[string]float64)
 
-		for _, pvc := range v {
+		for _, pvc := range vols {
 			notebookPvcLogger := notebookLogger.With("PVC", pvc.Name)
 
-			timeUntilStale, err := cfg.getTimeUntilStale(pvc, cfg.params.gracePeriod, notebookPvcLogger)
+			timeUntilStale, err := cfg.getTimeUntilStale(pvc, cfg.params.gracePeriod)
 			if err != nil {
-				notebookPvcLogger.Error("Error while getting time until stale for PVC", "ERROR", err)
+				cfg.report.errorsReported++
+				notebookPvcLogger.Error("Error while getting time until stale for PVC", "PVC_STATUS", pvc.Status.Phase, "ERROR", err)
 				continue
 			}
 
-			isStale := 0 > timeUntilStale
-			if !isStale {
-				notebookPvcLogger.Info("PVC not stale.", "TIME_UNTIL_STALE", timeUntilStale)
-				nonStaleVolumesMap[pvc.Name] = timeUntilStale
-				// slog.Info("test time", "PVC", pvc.Name, "TIME_UNTIL_STALE", timeUntilStale, "MAP", nonStaleVolumesMap)
-			} else {
-				notebookPvcLogger.Info("PVC is stale")
+			isStale := timeUntilStale < 0
+			if isStale {
+				notebookPvcLogger.Info("PVC is stale", "TIME_UNTIL_STALE", timeUntilStale)
 				staleVolumesCount++
+			} else {
+				notebookPvcLogger.Info("PVC is not stale.", "TIME_UNTIL_STALE", timeUntilStale)
+				nonStaleVolumesMap[pvc.Name] = timeUntilStale
 			}
 		}
 
 		// only proceed to cleaning the notebook (and its volumes) if all the volumes are stale
-		if staleVolumesCount == len(v) {
-			//TODO: also notify user when their notebook and pvcs get deleted?
-			err := cfg.deleteNotebookAndPvcs(ns, k, v, notebookLogger)
+		if staleVolumesCount == len(vols) {
+			notebookLogger.Info("Notebook and its PVCs are stale")
+			err := cfg.deleteNotebookAndPvcs(ns, notebook, vols, notebookLogger)
 			if err != nil {
+				cfg.report.errorsReported++
 				notebookLogger.Error("Error while trying to delete notebook and its PVCs.", "ERROR", err)
-				return err
-			}
-		} else if !cfg.disableNotifications {
-			// if the notebook and PVCs are not yet stale, determine if users needs to be notified of impending stale disks.
-			notebookLogger.Info("Notebook is not fully stale. Notifying user of upcoming stale volumes for the noteboook")
-			// TODO: Make logic to notify a user when they have a notebook with one or more volumes that is stale
-			// Could just loop over the notifyPvcOwner Fn for each pvc, but we might be able to just run this once for the whole notebook & its volumes
-			// We would just have to most likely tweak the email format.
-
-			if ownerEmail == "" {
-				logger.Warn("Namespace owner email could not be found. Skipping email notifications")
 				continue
 			}
-			for _, vol := range v {
-				err := cfg.notifyPvcOwner(ownerEmail, nonStaleVolumesMap[vol.Name], vol, httpClient, notebookLogger)
-				if err != nil {
-					notebookLogger.Error("Error while trying to notify user", "ERROR", err)
+
+			if !cfg.disableNotifications {
+				//TODO: also notify user when their notebook and pvcs does get deleted?
+				for _, pvc := range vols {
+					err = cfg.sendDeleteEmail()
+					if err != nil {
+						cfg.report.errorsReported++
+						notebookLogger.Error("Error while sending email to user about recently deleted volume", "PVC", pvc.Name, "ERROR", err)
+						continue
+					}
+				}
+			}
+
+			continue
+		} else {
+			// if the notebook and PVCs are not yet stale, determine if users needs to be notified of impending stale disks.
+			notebookLogger.Info("Notebook and its PVCS are not fully stale")
+
+			if !cfg.disableNotifications {
+				// TODO: Make logic to notify a user when they have a notebook with one or more volumes that is stale
+				// Could just loop over the notifyPvcOwner Fn for each pvc, but we might be able to just run this once for the whole notebook & its volumes
+				// We would just have to most likely tweak the email format.
+
+				if ownerEmail == "" {
+					logger.Warn("Namespace owner email could not be found. Skipping email notifications")
 					continue
+				}
+				for _, pvc := range vols {
+					err := cfg.notifyUserStaleVolume(ownerEmail, nonStaleVolumesMap[pvc.Name], pvc, notebookLogger)
+					if err != nil {
+						cfg.report.errorsReported++
+						notebookLogger.Error("Error while trying to notify user", "ERROR", err)
+						continue
+					}
 				}
 			}
 		}
@@ -249,17 +284,19 @@ func (cfg *CleanerConfigs) cleanAttachedNamespaceVolumes(ns string, notebookPvcM
 	return nil
 }
 
-// Helper function to return a map of notebooks and their attached volumes.
-// Will also update the given set to get all attached volumes
-func setupNotebooksPvcsInfo(kubeflowClient *kubeflow.Clientset, ns string, pvcsMap map[string]corev1.PersistentVolumeClaim, attachedPVCs map[string]bool, logger *slog.Logger) (map[string][]corev1.PersistentVolumeClaim, error) {
-	// get notebooks for profile namespace
+// Function to format the data of a namespace for the list of Kubeflow Notebooks and their attached volumes for easier manipulation
+// Returns:
+//   - Map of notebooks and their associated PVCs
+//   - Map of PVCs attached to notebooks. Using a map object to make it a unique list. The bool value is irrelevant.
+//   - Error
+func getNotebooksPvcsInfo(kubeflowClient *kubeflow.Clientset, ns string, pvcsMap map[string]corev1.PersistentVolumeClaim) (map[string][]corev1.PersistentVolumeClaim, map[string]bool, error) {
 	notebooks, err := kubeflowClient.KubeflowV1().Notebooks(ns).List(context.TODO(), v1.ListOptions{})
 	if err != nil {
-		logger.Error("Error while getting notebooks", "ERROR", err)
-		return nil, err
+		return nil, nil, err
 	}
 
 	notebooksPvcMap := make(map[string][]corev1.PersistentVolumeClaim)
+	attachedPVCs := make(map[string]bool)
 
 	for _, nb := range notebooks.Items {
 		vols := make([]corev1.PersistentVolumeClaim, 0)
@@ -276,50 +313,47 @@ func setupNotebooksPvcsInfo(kubeflowClient *kubeflow.Clientset, ns string, pvcsM
 		}
 	}
 
-	return notebooksPvcMap, nil
+	return notebooksPvcMap, attachedPVCs, nil
 }
 
-// Gets the time of when a PVC was last used
-func (cfg *CleanerConfigs) getPvcLastOwnershipTime(pvc corev1.PersistentVolumeClaim, logger *slog.Logger) (*time.Time, error) {
-	pv, err := cfg.clientset.CoreV1().PersistentVolumes().Get(context.TODO(), pvc.Spec.VolumeName, v1.GetOptions{})
+// Query Azure to get the last Ownership time for the given volume handle.
+// The returned value represents the last time the volume was attached to a running pod.
+// TODO: This is currently doing one call per PV. Maybe it should be changed to get all the disks in 1 call to azure, and then we filter through that list?
+// TODO: This would limit the calls to azure from n calls to 1 call. Might help with networking speed. But the payload would be larger and all stored in memory.
+func (cfg *CleanerConfigs) getPvcLastOwnershipTimeFromAzure(volumeHandle string) (*time.Time, error) {
+	// Get the Azure Disk name from the PV resource
+	diskHandleSplit := strings.Split(volumeHandle, "/")
+	diskName := diskHandleSplit[len(diskHandleSplit)-1]
+
+	// Get the disk information from Azure
+	diskResponse, err := cfg.disksClient.Get(context.TODO(), cfg.params.azureResourceGroup, diskName, nil)
 	if err != nil {
-		logger.Error("Error while getting Persistent Volume for PVC", "PVC_STATUS", pvc.Status.Phase, "PV", pvc.Spec.VolumeName, "ERROR", err)
-		return nil, err
+		return nil, fmt.Errorf("Error while getting Azure Disk %s: %s", diskName, err.Error())
 	}
 
-	lastOwnershipTime, err := getPvcLastOwnershipTimeFromAzure(cfg.disksClient, pvc, *pv, cfg.params.azureResourceGroup, logger)
-	if lastOwnershipTime == nil || err != nil {
-		logger.Error("Error while getting last ownership time for PVC")
-		return nil, err
-	}
+	lastOwnershipTime := diskResponse.Properties.LastOwnershipUpdateTime
+	createdTime := diskResponse.Properties.TimeCreated
 
-	if lastOwnershipTime == nil {
-		return lastOwnershipTime, errors.New("Cannot determine when PVC was last used. Last Ownership Time and Time Created on Azure Disk are null")
+	if lastOwnershipTime == nil && createdTime == nil {
+		return nil, fmt.Errorf("Cannot determine last time Disk %s was used. Last Ownership Update time and Time Created are both empty", diskName)
+	} else if lastOwnershipTime == nil {
+		// If the last ownership update time is null, return the Time Create instead
+		return createdTime, nil
 	}
 
 	return lastOwnershipTime, nil
 }
 
-// Query Azure to get the last Ownership time for a PVC.
-// This value represents the last time the PVC was attached to a running pod.
-func getPvcLastOwnershipTimeFromAzure(disksClient *armcompute.DisksClient, pvc corev1.PersistentVolumeClaim, pv corev1.PersistentVolume, resourceGroup string, logger *slog.Logger) (*time.Time, error) {
-	// Get the Azure Disk name from the PV resource
-	diskHandle := pv.Spec.CSI.VolumeHandle
-	diskHandleSplit := strings.Split(diskHandle, "/")
-	diskName := diskHandleSplit[len(diskHandleSplit)-1]
-
-	// Get the disk information from Azure
-	diskResponse, err := disksClient.Get(context.TODO(), resourceGroup, diskName, nil)
+// Gets the time of when a PVC was last used
+func (cfg *CleanerConfigs) getPvcLastOwnershipTime(pvc corev1.PersistentVolumeClaim) (*time.Time, error) {
+	pv, err := cfg.clientset.CoreV1().PersistentVolumes().Get(context.TODO(), pvc.Spec.VolumeName, v1.GetOptions{})
 	if err != nil {
-		logger.Error("Error while getting Azure Disk", "DISK_NAME", diskName, "ERROR", err)
-		return nil, err
+		return nil, fmt.Errorf("Error while getting Persistent Volume: %s", err.Error())
 	}
 
-	// Convert the lastOwnershipUpdateTime into Time format
-	lastOwnershipTime := diskResponse.Properties.LastOwnershipUpdateTime
-	if lastOwnershipTime == nil {
-		logger.Warn("Last Ownership Update Time is null. Using Time Created instead", "DISK_NAME", diskName)
-		return diskResponse.Properties.TimeCreated, nil
+	lastOwnershipTime, err := cfg.getPvcLastOwnershipTimeFromAzure(pv.Spec.CSI.VolumeHandle)
+	if err != nil {
+		return nil, fmt.Errorf("Error while getting Last Ownership Time from Azure: %s", err.Error())
 	}
 
 	return lastOwnershipTime, nil
@@ -327,44 +361,42 @@ func getPvcLastOwnershipTimeFromAzure(disksClient *armcompute.DisksClient, pvc c
 
 // Returns the time until a PVC is stale
 // A negative value means that the PVC is stale
-func (cfg *CleanerConfigs) getTimeUntilStale(pvc corev1.PersistentVolumeClaim, gracePeriod int, logger *slog.Logger) (float64, error) {
-	lastOwnershipTime, err := cfg.getPvcLastOwnershipTime(pvc, logger)
+func (cfg *CleanerConfigs) getTimeUntilStale(pvc corev1.PersistentVolumeClaim, gracePeriod int) (float64, error) {
+	lastOwnershipTime, err := cfg.getPvcLastOwnershipTime(pvc)
 	if err != nil {
-		logger.Error("Error while getting last ownership time for PVC", "ERROR", err)
-		return 0, err
+		return 0, fmt.Errorf("Error while getting last ownership time for PVC: %s", err.Error())
 	}
-
-	logger.Info("Retrieved last ownership time for PVC", "TIME", lastOwnershipTime)
 
 	// difference in days
 	diff := time.Since(*lastOwnershipTime).Hours() / 24
-
-	logger.Info("Time passed since PVC was last used (in days)", "TIME", diff)
 
 	return float64(gracePeriod) - diff, nil
 }
 
 func (cfg *CleanerConfigs) deletePvc(pvc corev1.PersistentVolumeClaim, logger *slog.Logger) error {
 	if cfg.params.dryRun {
+		cfg.report.volumesDeleted++
 		logger.Info("[DRY RUN] Deleted PVC")
 		return nil
 	}
 
 	err := cfg.clientset.CoreV1().PersistentVolumeClaims(pvc.Namespace).Delete(context.TODO(), pvc.Name, v1.DeleteOptions{})
 	if err != nil {
-		logger.Error("Error while deleting PVC", "ERROR", err)
-		return err
+		return fmt.Errorf("Error while deleting PVC %s: %s", pvc.Name, err.Error())
 	}
 
+	cfg.report.volumesDeleted++
 	logger.Info("Deleted PVC")
 	return nil
 }
 
 func (cfg *CleanerConfigs) deleteNotebookAndPvcs(namespace string, notebook string, pvcs []corev1.PersistentVolumeClaim, logger *slog.Logger) error {
 	if cfg.params.dryRun {
+		cfg.report.notebooksDeleted++
 		logger.Info("[DRY RUN] Deleted Notebook")
 
 		for _, pvc := range pvcs {
+			cfg.report.volumesDeleted++
 			logger.Info("[DRY RUN] Deleted attached PVC", "PVC", pvc.Name)
 		}
 
@@ -373,23 +405,70 @@ func (cfg *CleanerConfigs) deleteNotebookAndPvcs(namespace string, notebook stri
 
 	err := cfg.kubeflowClient.KubeflowV1().Notebooks(namespace).Delete(context.TODO(), notebook, v1.DeleteOptions{})
 	if err != nil {
-		logger.Error("Error while deleting Notebook", "ERROR", err)
-		return err
+		return fmt.Errorf("Error while deleting Notebook: %s", err.Error())
 	}
 
+	cfg.report.notebooksDeleted++
 	logger.Info("Deleted Notebook")
 
 	for _, pvc := range pvcs {
 		err := cfg.deletePvc(pvc, logger)
 		if err != nil {
-			return err
+			return fmt.Errorf("Error while deleting attached PVC %s: %s", pvc.Name, err.Error())
 		}
+
+		logger.Info("Deleted PVC", "PVC", pvc.Name)
 	}
 
 	return nil
 }
 
-func (cfg *CleanerConfigs) notifyPvcOwner(ownerEmail string, timeUntilStale float64, pvc corev1.PersistentVolumeClaim, httpClient *http.Client, logger *slog.Logger) error {
+func (cfg *CleanerConfigs) getNotificationCountLabelValue(timeUntilStale float64, pvc corev1.PersistentVolumeClaim, logger *slog.Logger) (int, error) {
+	notifCountString, ok := pvc.Labels[NOTIFICATION_COUNT_LABEL]
+	if !ok {
+		// if notif count label is not present, we can assume that this is the first time the pvc is evaluated
+		logger.Warn("Notification Count label not found. Defaulting to nearest value (without going over) in notification times parameter")
+
+		notifCount := 0
+		// Loops through the defined notification times to find the nearest value without going over.
+		for i := 0; i < len(cfg.params.notificationTimes); i++ {
+			if timeUntilStale > float64(cfg.params.notificationTimes[i]) {
+				// In theory this should not break on the first run of the loop since
+				// we already check for that condition prior to calling this function
+				break
+			}
+
+			notifCount = i
+		}
+
+		return notifCount, nil
+	}
+
+	notifCount, err := strconv.Atoi(notifCountString)
+	if err != nil {
+		return 0, fmt.Errorf("Failed to parse notification count label: %s", err.Error())
+	}
+
+	return notifCount, nil
+}
+
+// checks email times and determines if this pvc's owner should be emailed
+func (cfg *CleanerConfigs) shouldSendStaleEmail(timeUntilStale float64, notifCount int, logger *slog.Logger) bool {
+	if notifCount < len(cfg.params.notificationTimes) {
+		currentNotifTime := float64(cfg.params.notificationTimes[notifCount])
+
+		if currentNotifTime >= timeUntilStale {
+			logger.Info("Email will be sent.", "CLOSEST_EMAIL_INTERVAL_DAYS", currentNotifTime)
+			return true
+		}
+
+		logger.Info("Email will not be sent", "DAYS_UNTIL_NEXT_EMAIL", timeUntilStale-currentNotifTime)
+	}
+
+	return false
+}
+
+func (cfg *CleanerConfigs) notifyUserStaleVolume(ownerEmail string, timeUntilStale float64, pvc corev1.PersistentVolumeClaim, logger *slog.Logger) error {
 	logger.Info("Notifying user of volume approching deletion")
 
 	if len(cfg.params.notificationTimes) == 0 {
@@ -397,133 +476,69 @@ func (cfg *CleanerConfigs) notifyPvcOwner(ownerEmail string, timeUntilStale floa
 		return nil
 	}
 
-	// If volume was used more recently than our farthest notification time,
-	// Reset the notification count label and don't notify the user
-	if float64(cfg.params.notificationTimes[0]) < timeUntilStale {
+	// If volume was used more recently than our largest notification time,
+	// reset the notification count label and don't notify the user
+	if timeUntilStale > float64(cfg.params.notificationTimes[0]) {
 		if cfg.params.dryRun {
-			// log.Print("[DRY RUN] Email owner.")
-			// emailCount++
-			// continue
-
-			logger.Info("[DRY RUN] Volume was used recently. Resetting the notification count label and avoid sending notification", "TIME_UNTIL_STALE", timeUntilStale)
+			logger.Info("[DRY RUN] Volume was used recently. Reset the notification count label and avoided sending notification", "TIME_UNTIL_STALE", timeUntilStale)
 			return nil
 		}
 
-		logger.Info("Volume was used recently. Resetting the notification count label and avoid sending notification", "TIME_UNTIL_STALE", timeUntilStale)
 		err := cleanerUtils.RemovePvcLabel(cfg.clientset, NOTIFICATION_COUNT_LABEL, pvc.Namespace, pvc.Name)
 		if err != nil {
-			logger.Error("Error while resetting notification count label", "ERROR", err)
-			return err
-		}
-	}
-
-	notifCountString, ok := pvc.Labels[NOTIFICATION_COUNT_LABEL]
-	if !ok {
-		// log.Printf("[INFO] Label %s not found. Skipping.", cfg.NotifLabel)
-		// errCount++
-		// continue
-
-		// if notif count label is not present, assume this is the first time the pvc is evaluated
-		logger.Info("Notification Count label not found. Defaulting to nearest value")
-		notifCountString = "0"
-		tempVal := 0
-		// Loops through the defined notification times to find the nearest value without going over.
-		for i := 0; i < len(cfg.params.notificationTimes); i++ {
-			// slog.Info("test1", "v1", cfg.params.NotificationTimes[i], "v2", timeUntilStale)
-			if float64(cfg.params.notificationTimes[i]) < timeUntilStale {
-				break
-			}
-
-			tempVal = i
+			// logger.Error("Error while resetting notification count label", "ERROR", err)
+			return fmt.Errorf("Error while resetting notification count label: %s", err.Error())
 		}
 
-		notifCountString = strconv.Itoa(tempVal)
+		logger.Info("Volume was used recently. Reset the notification count label and avoided sending notification", "TIME_UNTIL_STALE", timeUntilStale)
+		return nil
 	}
 
-	notifCount, err := strconv.Atoi(notifCountString)
+	notifCount, err := cfg.getNotificationCountLabelValue(timeUntilStale, pvc, logger)
 	if err != nil {
-		// log.Printf("[ERROR] Failed to parse notification count: %v", countErr)
-		// errCount++
-		// continue
-
-		logger.Error("Failed to parse notification count label", "ERROR", err)
-		return err
+		return fmt.Errorf("Failed to get Notification Count label value: %s", err.Error())
 	}
 
-	shouldSendMail := cfg.ShouldSendMail(timeUntilStale, notifCount, logger)
-	// if err != nil {
-	// 	// log.Printf("[ERROR] Failed to parse timestamp: %s", mailError)
-	// 	// errCount++
-	// 	// continue
-	// 	logger.Error("Error while trying to determine if email should be sent", "ERROR", err)
-	// }
+	// Exit from the function if it should not send an email
+	if !cfg.shouldSendStaleEmail(timeUntilStale, notifCount, logger) {
+		return nil
+	}
 
-	if shouldSendMail {
-		if cfg.params.dryRun {
-			// log.Print("[DRY RUN] Email owner.")
-			// emailCount++
-			// continue
+	if cfg.params.dryRun {
+		cfg.report.emailsSent++
+		logger.Info("[DRY RUN] Email notification sent", "EMAIL", ownerEmail, "TIME_UNTIL_STALE", timeUntilStale)
+		return nil
+	}
 
-			logger.Info("[DRY RUN] Email owner.", "TIME_UNTIL_STALE", timeUntilStale)
-			return nil
-		}
+	personalisation := cleanerUtils.GetEmailPersonalisation(pvc.Namespace, pvc.Name, timeUntilStale)
 
-		// personal consists of details passed into the email template as variables while email is
-		// the email address that is consistent regardless of the template
+	// TODO: Instead of sending 1 email per pvc, we should instead send one email per namespace with a report of what is getting stale.
+	err = cleanerUtils.SendEmail(cfg.httpClient, cfg.emailConfigs, ownerEmail, personalisation)
+	if err != nil {
+		return fmt.Errorf("Error while sending email to %s with details %+v: %s", ownerEmail, personalisation, err.Error())
+	}
 
-		// email, personal := utilsInternal.EmailDetails(kube, pvc, daysLeft)
-		personalisation := cleanerUtils.GetEmailPersonalisation(pvc.Namespace, pvc.Name, timeUntilStale)
+	cfg.report.emailsSent++
+	logger.Info("Email notification sent", "EMAIL", ownerEmail, "TIME_UNTIL_STALE", timeUntilStale)
 
-		// TODO: Instead of sending 1 email per pvc, we should instead send one email per namespace with a report of what is getting stale.
-		err := cleanerUtils.SendEmail(httpClient, cfg.emailConfigs, ownerEmail, personalisation)
-		if err != nil {
-			// log.Printf("[Error] Unable to send an email to %s at %s: %s", personal.Name, email, err)
-			// errCount++
-			// continue
-			logger.Error("Error while sending email", "EMAIL", ownerEmail, "EMAIL_DETAILS", personalisation, "ERROR", err)
-			return err
-		}
-
-		logger.Info("Email notification sent", "EMAIL", ownerEmail, "NAME", personalisation.Name)
-
-		// Update Email Count
-		// emailCount++
-
-		// Increment notification count by 1
-		newNotifCount := strconv.Itoa(notifCount + 1)
-		err = cleanerUtils.SetPvcLabel(cfg.clientset, NOTIFICATION_COUNT_LABEL, newNotifCount, pvc.Namespace, pvc.Name)
-		if err != nil {
-			logger.Error("Error while updating notification count label", "ERROR", err)
-			return err
-		}
+	// Increment notification count by 1
+	newNotifCount := strconv.Itoa(notifCount + 1)
+	err = cleanerUtils.SetPvcLabel(cfg.clientset, NOTIFICATION_COUNT_LABEL, newNotifCount, pvc.Namespace, pvc.Name)
+	if err != nil {
+		return fmt.Errorf("Error while updating notification count label: %s", err.Error())
 	}
 
 	return nil
 }
 
-// checks email times and determines if this pvc's owner should be emailed
-func (cfg *CleanerConfigs) ShouldSendMail(timeUntilStale float64, notifCount int, logger *slog.Logger) bool {
-	// timeObj, err := time.Parse(cfg.TimeFormat, timestamp)
-	// if err != nil {
-	// 	return false, 0.0, err
-	// }
-	// daysLeft := float64(cfg.GracePeriod) - time.Since(timeObj).Hours()/24
-
-	// this logic ensures that emails are eventually sent even if the
-	// scheduler is down and misses a few days
-
-	// log.Printf("[INFO] Emails already sent: %d", currNotif)
-
-	if notifCount < len(cfg.params.notificationTimes) {
-		currentNotifTime := float64(cfg.params.notificationTimes[notifCount])
-
-		if currentNotifTime >= timeUntilStale {
-			logger.Info("Email to be sent.", "CLOSEST_EMAIL_INTERVAL_DAYS", currentNotifTime)
-			return true
-		}
-
-		logger.Info("Email will not be sent", "DAYS_UNTIL_NEXT_EMAIL", timeUntilStale-currentNotifTime)
+func (cfg *CleanerConfigs) sendDeleteEmail() error {
+	if !cfg.shouldSendDeleteEmail() {
+		return nil
 	}
 
+	return nil
+}
+
+func (cfg *CleanerConfigs) shouldSendDeleteEmail() bool {
 	return false
 }

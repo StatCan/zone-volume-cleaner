@@ -33,7 +33,6 @@ type EmailPersonalisation struct {
 
 // Based on the given configs, sends a POST request to an email service to send an email
 func SendEmail(client *http.Client, conf EmailConfigs, emailAddress string, personal EmailPersonalisation) error {
-	// Request Body
 	reqBody, err := json.Marshal(
 		EmailRequestBody{
 			EmailAddress:    emailAddress,
@@ -54,7 +53,7 @@ func SendEmail(client *http.Client, conf EmailConfigs, emailAddress string, pers
 	request.Header.Add("Authorization", "ApiKey-v1 "+conf.APIKey)
 	request.Header.Add("Content-Type", "application/json")
 
-	// Send Request
+	// Send the email request
 	response, err := client.Do(request)
 	if err != nil {
 		return fmt.Errorf("Error while sending email request: %v", err)
@@ -62,7 +61,7 @@ func SendEmail(client *http.Client, conf EmailConfigs, emailAddress string, pers
 
 	defer response.Body.Close()
 
-	// we read the body mainly for debugging purposes in the error log messages
+	// Read the body for logging in case of errors
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		return fmt.Errorf("Error while reading body of email response: %v", err)
@@ -70,7 +69,7 @@ func SendEmail(client *http.Client, conf EmailConfigs, emailAddress string, pers
 
 	// Expected response is 201
 	if response.StatusCode != 201 {
-		return fmt.Errorf("Received unexpected response code %d for email request: %s", response.StatusCode, body)
+		return fmt.Errorf("Received unexpected response code %d from email request: %s", response.StatusCode, body)
 	}
 
 	return nil

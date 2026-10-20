@@ -11,8 +11,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// modifies pvc labels
-// requires sufficient rbac permissions
+// Patches the label from the PVC resource
 func patchPvcLabel(clientset *kubernetes.Clientset, label string, value string, ns string, pvc string) error {
 	patch := []byte(fmt.Sprintf(`{"metadata":{"labels":{"%s":%s}}}`, label, value))
 	_, err := clientset.CoreV1().PersistentVolumeClaims(ns).Patch(
@@ -26,16 +25,13 @@ func patchPvcLabel(clientset *kubernetes.Clientset, label string, value string, 
 	return err
 }
 
-// setting label will add it if doesn't exist
+// Updates the label value from the PVC resource, or adds the label if it doesnt exist
 func SetPvcLabel(clientset *kubernetes.Clientset, label string, value string, ns string, pvc string) error {
-	err := patchPvcLabel(clientset, label, fmt.Sprintf(`"%s"`, value), ns, pvc)
-
-	return err
+	return patchPvcLabel(clientset, label, fmt.Sprintf(`"%s"`, value), ns, pvc)
 }
 
-// setting label to null (not "null") will remove it
+// Removes the label from the PVC resource
 func RemovePvcLabel(clientset *kubernetes.Clientset, label string, ns string, pvc string) error {
-	err := patchPvcLabel(clientset, label, "null", ns, pvc)
-
-	return err
+	// setting label to null (not "null") will remove it
+	return patchPvcLabel(clientset, label, "null", ns, pvc)
 }
