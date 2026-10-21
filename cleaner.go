@@ -486,7 +486,6 @@ func (cfg *CleanerConfigs) notifyUserStaleVolume(ownerEmail string, timeUntilSta
 
 		err := cleanerUtils.RemovePvcLabel(cfg.clientset, NOTIFICATION_COUNT_LABEL, pvc.Namespace, pvc.Name)
 		if err != nil {
-			// logger.Error("Error while resetting notification count label", "ERROR", err)
 			return fmt.Errorf("Error while resetting notification count label: %s", err.Error())
 		}
 
@@ -531,6 +530,7 @@ func (cfg *CleanerConfigs) notifyUserStaleVolume(ownerEmail string, timeUntilSta
 	return nil
 }
 
+// TODO: Complete this function
 func (cfg *CleanerConfigs) sendDeleteEmail() error {
 	if !cfg.shouldSendDeleteEmail() {
 		return nil
@@ -539,6 +539,7 @@ func (cfg *CleanerConfigs) sendDeleteEmail() error {
 	return nil
 }
 
+// TODO: Complete this function
 func (cfg *CleanerConfigs) shouldSendDeleteEmail() bool {
 	return false
 }
