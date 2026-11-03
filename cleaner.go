@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -55,9 +56,9 @@ type simpleNotebook struct {
 }
 
 const (
-	NOTIFICATION_COUNT_LABEL = "zone-volume-cleaner/notification-count"
-	NS_OWNER_ANNOTATION      = "owner"
-	RUNNING_NOTEBOOK_LABEL   = "notebooks.kubeflow.org/last-activity"
+	NOTIFICATION_COUNT_LABEL    = "zone-volume-cleaner/notification-count"
+	NS_OWNER_ANNOTATION         = "owner"
+	RUNNING_NOTEBOOK_ANNOTATION = "notebooks.kubeflow.org/last-activity"
 )
 
 func (cfg *CleanerConfigs) cleanVolumes() {
@@ -215,7 +216,7 @@ func (cfg *CleanerConfigs) cleanAttachedNamespaceVolumes(ns string, notebookPvcM
 		notebookLogger := logger.With("NOTEBOOK", notebook.name)
 
 		if notebook.isRunning {
-			notebookLogger.Warn("Ignoring notebook that is currently running")
+			notebookLogger.Warn("Notebook is currently running. Volumes will not be cleaned.")
 			continue
 		}
 
@@ -321,7 +322,8 @@ func getNotebooksPvcsInfo(kubeflowClient *kubeflow.Clientset, ns string, pvcsMap
 		// we only care about notebooks that have volumes
 		if len(vols) > 0 {
 			// record if the notebook is running
-			_, isRunning := nb.Labels[RUNNING_NOTEBOOK_LABEL]
+			_, isRunning := nb.Annotations[RUNNING_NOTEBOOK_ANNOTATION]
+			log.Printf("testing %+v, %+v, %+v", nb.Name, nb.Annotations, isRunning)
 			simpleNb := simpleNotebook{
 				name:      nb.Name,
 				isRunning: isRunning,
