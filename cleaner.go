@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -323,7 +322,6 @@ func getNotebooksPvcsInfo(kubeflowClient *kubeflow.Clientset, ns string, pvcsMap
 		if len(vols) > 0 {
 			// record if the notebook is running
 			_, isRunning := nb.Annotations[RUNNING_NOTEBOOK_ANNOTATION]
-			log.Printf("testing %+v, %+v, %+v", nb.Name, nb.Annotations, isRunning)
 			simpleNb := simpleNotebook{
 				name:      nb.Name,
 				isRunning: isRunning,
