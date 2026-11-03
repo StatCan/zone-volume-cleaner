@@ -49,9 +49,15 @@ type CleanerConfigs struct {
 	report               *cleanerJobReport
 }
 
+type simpleNotebook struct {
+	name      string
+	isRunning bool
+}
+
 const (
 	NOTIFICATION_COUNT_LABEL = "zone-volume-cleaner/notification-count"
 	NS_OWNER_ANNOTATION      = "owner"
+	RUNNING_NOTEBOOK_LABEL   = "notebooks.kubeflow.org/last-activity"
 )
 
 func (cfg *CleanerConfigs) cleanVolumes() {
@@ -83,7 +89,7 @@ func (cfg *CleanerConfigs) cleanVolumes() {
 		err := cfg.cleanNamespaceVolumes(ns.Name, ownerEmail)
 		// Job report error count will be incremented inside the function
 		if err != nil {
-			slog.Error("Error occured while cleaning volumes for namespace", "NAMESPACE", cfg.params.testNamespace, "ERROR", err)
+			slog.Error("Error occured while cleaning volumes for namespace", "NAMESPACE", ns.Name, "ERROR", err)
 			// If an error occurs, move to the next namespace
 			continue
 		}
@@ -202,11 +208,16 @@ func (cfg *CleanerConfigs) cleanUnattachedNamespaceVolumes(pvcs []corev1.Persist
 	return nil
 }
 
-func (cfg *CleanerConfigs) cleanAttachedNamespaceVolumes(ns string, notebookPvcMap map[string][]corev1.PersistentVolumeClaim, ownerEmail string, logger *slog.Logger) error {
+func (cfg *CleanerConfigs) cleanAttachedNamespaceVolumes(ns string, notebookPvcMap map[simpleNotebook][]corev1.PersistentVolumeClaim, ownerEmail string, logger *slog.Logger) error {
 	logger.Info("Evaluating attached PVCs")
 
 	for notebook, vols := range notebookPvcMap {
-		notebookLogger := logger.With("NOTEBOOK", notebook)
+		notebookLogger := logger.With("NOTEBOOK", notebook.name)
+
+		if notebook.isRunning {
+			notebookLogger.Warn("Ignoring notebook that is currently running")
+			continue
+		}
 
 		staleVolumesCount := 0
 		// map to keep track of which volumes are stale. Used for email notfications
@@ -236,7 +247,7 @@ func (cfg *CleanerConfigs) cleanAttachedNamespaceVolumes(ns string, notebookPvcM
 		// only proceed to cleaning the notebook (and its volumes) if all the volumes are stale
 		if staleVolumesCount == len(vols) {
 			notebookLogger.Info("Notebook and its PVCs are stale")
-			err := cfg.deleteNotebookAndPvcs(ns, notebook, vols, notebookLogger)
+			err := cfg.deleteNotebookAndPvcs(ns, notebook.name, vols, notebookLogger)
 			if err != nil {
 				cfg.report.errorsReported++
 				notebookLogger.Error("Error while trying to delete notebook and its PVCs.", "ERROR", err)
@@ -289,13 +300,13 @@ func (cfg *CleanerConfigs) cleanAttachedNamespaceVolumes(ns string, notebookPvcM
 //   - Map of notebooks and their associated PVCs
 //   - Map of PVCs attached to notebooks. Using a map object to make it a unique list. The bool value is irrelevant.
 //   - Error
-func getNotebooksPvcsInfo(kubeflowClient *kubeflow.Clientset, ns string, pvcsMap map[string]corev1.PersistentVolumeClaim) (map[string][]corev1.PersistentVolumeClaim, map[string]bool, error) {
+func getNotebooksPvcsInfo(kubeflowClient *kubeflow.Clientset, ns string, pvcsMap map[string]corev1.PersistentVolumeClaim) (map[simpleNotebook][]corev1.PersistentVolumeClaim, map[string]bool, error) {
 	notebooks, err := kubeflowClient.KubeflowV1().Notebooks(ns).List(context.TODO(), v1.ListOptions{})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	notebooksPvcMap := make(map[string][]corev1.PersistentVolumeClaim)
+	notebooksPvcMap := make(map[simpleNotebook][]corev1.PersistentVolumeClaim)
 	attachedPVCs := make(map[string]bool)
 
 	for _, nb := range notebooks.Items {
@@ -309,7 +320,13 @@ func getNotebooksPvcsInfo(kubeflowClient *kubeflow.Clientset, ns string, pvcsMap
 
 		// we only care about notebooks that have volumes
 		if len(vols) > 0 {
-			notebooksPvcMap[nb.Name] = vols
+			// record if the notebook is running
+			_, isRunning := nb.Labels[RUNNING_NOTEBOOK_LABEL]
+			simpleNb := simpleNotebook{
+				name:      nb.Name,
+				isRunning: isRunning,
+			}
+			notebooksPvcMap[simpleNb] = vols
 		}
 	}
 
