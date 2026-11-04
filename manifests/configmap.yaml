@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zone-volume-cleaner-configs
+  namespace: zone
+data:
+  AZURE_RESOURCE_GROUP: ""
+  AZURE_SUBSCRIPTION_ID: ""
+  AZURE_TENANT_ID: ""
+  DRY_RUN: ""
+  GRACE_PERIOD: ""
+  NOTIF_TIMES: ""
+  TEST_EMAIL: ""
+  TEST_NAMESPACE: ""
+  EMAIL_BASE_URL: ""
+  EMAIL_ENDPOINT: ""

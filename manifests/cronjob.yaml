@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: zone-volume-cleaner
+  namespace: zone
+spec:
+  schedule: "0 0 * * *"
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        metadata:
+          labels:
+            app: zone-volume-cleaner
+        spec:
+          serviceAccountName: zone-volume-cleaner
+          containers:
+            - name: cleaner
+              image: artifactory.cloud.statcan.ca/das-aaw-docker/zone-volume-cleaner:latest
+              imagePullPolicy: Always
+              envFrom:
+                - configMapRef:
+                    name: zone-volume-cleaner-configs
+                - secretRef:
+                    name: zone-volume-cleaner-secret
+          restartPolicy: Never
